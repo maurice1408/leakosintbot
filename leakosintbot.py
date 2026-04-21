@@ -1,6 +1,7 @@
 # /// script
 # requires-python = ">=3.13"
 # dependencies = [
+#     "logfire==4.32.0",
 #     "marimo>=0.23.1",
 #     "polars==1.39.3",
 #     "pydantic==2.12.5",
@@ -14,6 +15,7 @@ import marimo
 __generated_with = "0.23.0"
 app = marimo.App(
     width="full",
+    app_title="leakosintbot",
     css_file="/usr/local/_marimo/custom.css",
     auto_download=["html"],
 )
@@ -33,21 +35,33 @@ def _():
     import urllib.parse
     from urllib3.util import Retry
 
+    import asyncio
+
+    import logfire
+
     retry_strategy = Retry(
         total=5, status_forcelist=[400, 403, 429], backoff_factor=2
     )
+
 
     adapter = HTTPAdapter(max_retries=retry_strategy)
 
     session = requests.Session()
     session.mount("https://", adapter)
-    return BaseModel, mo, pl, session
+    return BaseModel, logfire, mo, pl, session
 
 
 @app.cell
 def _():
-    TOKEN = "5719785178:G5kRVmQt"
-    return (TOKEN,)
+    TOKEN = "5231964349:1WP5h9Rl" # "5719785178:G5kRVmQt"
+    LOGFIRE_TOKEN = "pylf_v1_eu_CBXVK697GrxCT11jysbwN6DTJH52GXZ3JsNLNghnWnp1"
+    return LOGFIRE_TOKEN, TOKEN
+
+
+@app.cell
+def _(LOGFIRE_TOKEN, logfire):
+    _lf = logfire.configure(token=LOGFIRE_TOKEN, service_name="leakosintbot")
+    return
 
 
 @app.cell
@@ -60,48 +74,53 @@ def _(BaseModel):
     return (BotResults,)
 
 
-@app.function
-async def search(session,
-                token: str,
-                query: str,
-                limit: int = 100,
-                lang: str = 'en',
-                type: str = 'json',
-                bot_name: str = None) -> dict:
+@app.cell
+def search(logfire):
+    async def search(session,
+                    token: str,
+                    query: str,
+                    limit: int = 100,
+                    lang: str = 'en',
+                    type: str = 'json',
+                    bot_name: str = None) -> dict:
 
-    """
-    Parameter	Description
-    'token'	API token
-    'request'	A line with your request or an array of lines with several requests.
-    'limit'	Search limit (default 100). The number is from 100 to 10,000. 
-            It determines the number of returned results and the search range in the database.
-    'lang'	The language code on which there will be the results of the request (by default en ).
-    'type'	Type of reporting: json, short, html (By default json).
-    'bot_name'	The name of the bot in the format @name 
-            (it is necessary to indicate if the bot does not apply to the main group of mirrors).
-    """
+        """
+        Parameter	Description
+        'token'	API token
+        'request'	A line with your request or an array of lines with several requests.
+        'limit'	Search limit (default 100). The number is from 100 to 10,000. 
+                It determines the number of returned results and the search range in the database.
+        'lang'	The language code on which there will be the results of the request (by default en ).
+        'type'	Type of reporting: json, short, html (By default json).
+        'bot_name'	The name of the bot in the format @name 
+                (it is necessary to indicate if the bot does not apply to the main group of mirrors).
+        """
 
-    url = "https://leakosintapi.com/"
+        url = "https://leakosintapi.com/"
 
-    data ={
-            "token": token,
-            "request": query,
-            "limit": limit      
-          }
+        data ={
+                "token": token,
+                "request": query,
+                "limit": limit      
+              }
 
-    resp = session.post(
-        url,
-        headers={"Content-Type": "application/json"},
-        json=data
-    )
+        logfire.debug("Data: {data=!r}", data=data)
 
-    print(f"HTTP status code: {resp.status_code}")
+        resp = session.post(
+            url,
+            headers={"Content-Type": "application/json"},
+            json=data
+        )
 
-    return resp.json()
+        print(f"HTTP status code: {resp.status_code}")
+
+        return resp.json()
+
+    return (search,)
 
 
 @app.cell
-def _(BotResults):
+def _(BotResults, logfire):
     def generate_report(bot_results: dict):
 
         result_list = []
@@ -113,12 +132,6 @@ def _(BotResults):
             #print(f"Database name: {database_name}")
 
             if not database_name == "No results found":
-
-                result_meta = {
-                    "NumOfDatabase": bot_results.get("NumOfDatabase", 0),
-                    "NumOfResults": bot_results.get("NumOfResults", 0),
-                    "free_requests_left": bot_results.get("free_requests_left", 0)
-                }
 
                 for report_data in bot_results["List"][database_name]["Data"]:
 
@@ -139,6 +152,7 @@ def _(BotResults):
                     result_list.append(m)
 
             else:
+                logfire.error("No results returned")
                 d = {
                     "database_name": "No results found",
                     "data": "",
@@ -147,10 +161,17 @@ def _(BotResults):
                 m = BotResults.model_validate(d)
                 result_list.append(m)
 
-                result_meta = {}
-
             #if len(text)>3500:
             #    text = text[:3500]+text[3500:].split("\n")[0]+"\n\nSome data did not fit this message"
+        result_meta = {
+            "NumOfDatabase": bot_results.get("NumOfDatabase", 0),
+            "NumOfResults": bot_results.get("NumOfResults", 0),
+            "free_requests_left": bot_results.get("free_requests_left", 0),
+            "price": bot_results.get("price", 0),
+            "search time": bot_results.get("search time", 0)
+        }
+
+        logfire.debug("Query: {meta=!r}", meta=result_meta)
 
         return result_meta, result_list
 
@@ -176,14 +197,14 @@ def _(mo):
     search_input = mo.ui.text(label="Search String",
                               debounce=True,
                               full_width=True,
-                              placeholder="Enter search text and hit Enter or tab ⇥"
+                              placeholder="Enter search text and hit ↩️ Enter or tab ⇥"
                              )
     search_input
     return (search_input,)
 
 
 @app.cell
-async def _(TOKEN, mo, res_slider, search_input, session):
+async def _(TOKEN, mo, res_slider, search, search_input, session):
     mo.stop(len(search_input.value.strip()) == 0)
 
     print(search_input.value)
@@ -198,8 +219,26 @@ async def _(TOKEN, mo, res_slider, search_input, session):
 
 
 @app.cell
-def _(bot_results, generate_report):
+def _():
+    return
+
+
+@app.cell
+def _(bot_results, generate_report, mo, search_input):
+    _no_res = None
+
     res_meta, res_list = generate_report(bot_results)
+
+    if ((len(res_list) == 1) and res_list[0].database_name.lower() == "no results found" ):
+        _no_res = mo.md(f"""
+        /// admonition | Note
+            type: warning
+
+        No results found for: {search_input.value}
+        ///
+        """)
+
+    _no_res
     return res_list, res_meta
 
 
@@ -208,8 +247,10 @@ def _(mo, res_meta):
     sts = mo.hstack([
         mo.stat(label="Number of Databases", value=res_meta.get("NumOfDatabase", 0)),
         mo.stat(label="Number of Results", value=res_meta.get("NumOfResults", 0)),
-        mo.stat(label="Free Requests Remaining", value=res_meta.get("free_requests_left", 0))    
-    ])
+        mo.stat(label="Free Requests Remaining", value=res_meta.get("free_requests_left", 0)),
+        mo.stat(label="Price", value=res_meta.get("price", 0)),
+        mo.stat(label="Search Time", value=res_meta.get("search time", 0)),
+    ], justify="center", gap="2rem")
     return (sts,)
 
 
