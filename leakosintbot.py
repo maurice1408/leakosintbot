@@ -1,7 +1,9 @@
 # /// script
 # requires-python = ">=3.13"
 # dependencies = [
-#     "logfire==4.32.0",
+#     "httpx-retries==0.5.0",
+#     "httpxyz==0.30.0",
+#     "logfire[httpx]==4.32.1",
 #     "marimo>=0.23.1",
 #     "polars==1.39.3",
 #     "pydantic==2.12.5",
@@ -23,45 +25,75 @@ app = marimo.App(
 
 @app.cell
 def _():
-    import marimo as mo
-    import requests
-    import polars as pl
-
-    from requests.adapters import HTTPAdapter
-
-    from pydantic import BaseModel, Field, BeforeValidator
-    from typing import Optional, List, Any, Annotated
-
-    import urllib.parse
-    from urllib3.util import Retry
-
-    import asyncio
-
-    import logfire
-
-    retry_strategy = Retry(
-        total=5, status_forcelist=[400, 403, 429], backoff_factor=2
-    )
-
-
-    adapter = HTTPAdapter(max_retries=retry_strategy)
-
-    session = requests.Session()
-    session.mount("https://", adapter)
-    return BaseModel, logfire, mo, pl, session
-
-
-@app.cell
-def _():
     TOKEN = "5231964349:1WP5h9Rl" # "5719785178:G5kRVmQt"
     LOGFIRE_TOKEN = "pylf_v1_eu_CBXVK697GrxCT11jysbwN6DTJH52GXZ3JsNLNghnWnp1"
     return LOGFIRE_TOKEN, TOKEN
 
 
 @app.cell
-def _(LOGFIRE_TOKEN, logfire):
+def _(LOGFIRE_TOKEN):
+    import marimo as mo
+    import httpxyz
+    import polars as pl
+    import time
+
+    from httpx_retries import RetryTransport
+    from httpx_retries import Retry
+
+    from pydantic import BaseModel, Field, BeforeValidator
+    from typing import Optional, List, Any, Annotated
+
+    # import urllib.parse
+    # from urllib3.util import Retry
+
+    import asyncio
+
+    import logging
+    from logging import basicConfig, getLogger
+
+    logging.basicConfig(
+        format="%(levelname)s [%(asctime)s] %(name)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        level=logging.DEBUG
+    )
+
+    import logfire
+
     _lf = logfire.configure(token=LOGFIRE_TOKEN, service_name="leakosintbot")
-    return
+
+    basicConfig(handlers=[logfire.LogfireLoggingHandler()])
+
+    logfire.instrument_httpx(
+        capture_request_body=True,
+        capture_response_body=False,
+        capture_headers=True
+    )
+
+    request_duration = logfire.metric_histogram(
+        'request_duration',
+        unit='ms',description="Duration of call to leakosingbot"
+    )
+
+    logger = getLogger(__name__)
+
+    retry_strategy = Retry(
+        total=5, status_forcelist=[400, 403, 429], backoff_factor=2
+    )
+
+    transport = RetryTransport(retry=retry_strategy)
+
+    client = httpxyz.Client(transport=transport, timeout=60)
+    return (
+        BaseModel,
+        client,
+        httpxyz,
+        logfire,
+        logger,
+        mo,
+        pl,
+        request_duration,
+        time,
+    )
 
 
 @app.cell
@@ -75,8 +107,8 @@ def _(BaseModel):
 
 
 @app.cell
-def search(logfire):
-    async def search(session,
+def search(httpxyz, logger, request_duration, time):
+    async def search(client,
                     token: str,
                     query: str,
                     limit: int = 100,
@@ -86,14 +118,14 @@ def search(logfire):
 
         """
         Parameter	Description
-        'token'	API token
+        'token'	    API token
         'request'	A line with your request or an array of lines with several requests.
-        'limit'	Search limit (default 100). The number is from 100 to 10,000. 
-                It determines the number of returned results and the search range in the database.
-        'lang'	The language code on which there will be the results of the request (by default en ).
-        'type'	Type of reporting: json, short, html (By default json).
+        'limit'	    Search limit (default 100). The number is from 100 to 10,000. 
+                    It determines the number of returned results and the search range in the database.
+        'lang'	    The language code on which there will be the results of the request (by default en ).
+        'type'	    Type of reporting: json, short, html (By default json).
         'bot_name'	The name of the bot in the format @name 
-                (it is necessary to indicate if the bot does not apply to the main group of mirrors).
+                    (it is necessary to indicate if the bot does not apply to the main group of mirrors).
         """
 
         url = "https://leakosintapi.com/"
@@ -104,15 +136,24 @@ def search(logfire):
                 "limit": limit      
               }
 
-        logfire.debug("Data: {data=!r}", data=data)
+        # logfire.debug("Data: {data=!r}", data=data)
 
-        resp = session.post(
-            url,
-            headers={"Content-Type": "application/json"},
-            json=data
-        )
+        try:
+            start = time.perf_counter()
 
-        print(f"HTTP status code: {resp.status_code}")
+            resp = client.post(
+                url,
+                headers={"Content-Type": "application/json"},
+                json=data
+            )
+
+            duration_ms = (time.perf_counter() - start) *  1000
+            request_duration.record(duration_ms)
+
+        except httpxyz.ReadTimeout as exc:
+            logger.error("Request timed out")
+
+        # print(f"HTTP status code: {resp.status_code}")
 
         return resp.json()
 
@@ -204,13 +245,13 @@ def _(mo):
 
 
 @app.cell
-async def _(TOKEN, mo, res_slider, search, search_input, session):
+async def _(TOKEN, client, mo, res_slider, search, search_input):
     mo.stop(len(search_input.value.strip()) == 0)
 
     print(search_input.value)
 
     with mo.status.spinner(title="Searching...") as _spinner:
-        bot_results = await search(session,
+        bot_results = await search(client,
                             TOKEN,
                             search_input.value,
                             limit=res_slider.value)
@@ -226,6 +267,7 @@ def _():
 @app.cell
 def _(bot_results, generate_report, mo, search_input):
     _no_res = None
+    no_results_found = False
 
     res_meta, res_list = generate_report(bot_results)
 
@@ -238,8 +280,11 @@ def _(bot_results, generate_report, mo, search_input):
         ///
         """)
 
+        no_results_found = True
+
+
     _no_res
-    return res_list, res_meta
+    return no_results_found, res_list, res_meta
 
 
 @app.cell
@@ -255,7 +300,8 @@ def _(mo, res_meta):
 
 
 @app.cell
-def _(pl, res_list):
+def _(mo, no_results_found, pl, res_list):
+    mo.stop(no_results_found)
     df = pl.DataFrame(res_list)
     return (df,)
 
